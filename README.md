@@ -57,6 +57,12 @@ Run `kimi` command in the directory you want to work on, then send `/setup` to s
 
 After setup, Kimi CLI will be ready to use. You can send `/help` to get more information.
 
+### Documentation
+
+For comprehensive documentation, see:
+- [User Guide](./docs/user-guide.md) - Complete guide to all features
+- [Quick Reference](./docs/quick-reference.md) - Essential commands and shortcuts
+
 ## Features
 
 ### Shell mode
