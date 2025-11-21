@@ -29,6 +29,10 @@ test: ## Run the test suite with pytest.
 build: ## Build the standalone executable with PyInstaller.
 	uv run pyinstaller kimi.spec
 
+.PHONY: install
+install: ## Install kimi globally as editable (uv tool).
+	uv tool install --force --editable .
+
 .PHONY: ai-test
 ai-test: ## Run the test suite with Kimi CLI.
 	uv run tests_ai/scripts/run.py tests_ai
