@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 import base64
 import contextlib
@@ -16,10 +18,11 @@ from io import BytesIO
 from pathlib import Path
 from typing import override
 
-from kosong.base.message import ContentPart, ImageURLPart, TextPart
+from kosong.message import ContentPart, ImageURLPart, TextPart
 from PIL import Image, ImageGrab
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
+from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.clipboard.pyperclip import PyperclipClipboard
 from prompt_toolkit.completion import (
     Completer,
@@ -30,13 +33,14 @@ from prompt_toolkit.completion import (
     merge_completers,
 )
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Always, Condition, Never, has_completions
+from prompt_toolkit.filters import Condition, has_completions
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.patch_stdout import patch_stdout
 from pydantic import BaseModel, ValidationError
 
+from kaos.path import KaosPath
 from kimi_cli.llm import ModelCapability
 from kimi_cli.share import get_share_dir
 from kimi_cli.soul import StatusSnapshot
@@ -90,7 +94,7 @@ class MetaCommandCompleter(Completer):
                 )
 
 
-class FileMentionCompleter(Completer):
+class LocalFileMentionCompleter(Completer):
     """Offer fuzzy `@` path completion by indexing workspace files."""
 
     _FRAGMENT_PATTERN = re.compile(r"[^\s@]+")
@@ -282,7 +286,7 @@ class FileMentionCompleter(Completer):
 
         if index > 0:
             prev = text[index - 1]
-            if prev.isalnum() or prev in FileMentionCompleter._TRIGGER_GUARDS:
+            if prev.isalnum() or prev in LocalFileMentionCompleter._TRIGGER_GUARDS:
                 return None
 
         fragment = text[index + 1 :]
@@ -314,7 +318,26 @@ class FileMentionCompleter(Completer):
         mention_doc = Document(text=fragment, cursor_position=len(fragment))
         self._fragment_hint = fragment
         try:
-            yield from self._fuzzy.get_completions(mention_doc, complete_event)
+            # First, ask the fuzzy completer for candidates.
+            candidates = list(self._fuzzy.get_completions(mention_doc, complete_event))
+
+            # re-rank: prefer basename matches
+            frag_lower = fragment.lower()
+
+            def _rank(c: Completion) -> tuple:
+                path = c.text
+                base = path.rstrip("/").split("/")[-1].lower()
+                if base.startswith(frag_lower):
+                    cat = 0
+                elif frag_lower in base:
+                    cat = 1
+                else:
+                    cat = 2
+                # preserve original FuzzyCompleter's order in the same category
+                return (cat,)
+
+            candidates.sort(key=_rank)
+            yield from candidates
         finally:
             self._fragment_hint = None
 
@@ -365,7 +388,7 @@ class PromptMode(Enum):
     AGENT = "agent"
     SHELL = "shell"
 
-    def toggle(self) -> "PromptMode":
+    def toggle(self) -> PromptMode:
         return PromptMode.SHELL if self == PromptMode.AGENT else PromptMode.AGENT
 
     def __str__(self) -> str:
@@ -451,7 +474,7 @@ class CustomPromptSession:
     ) -> None:
         history_dir = get_share_dir() / "user-history"
         history_dir.mkdir(parents=True, exist_ok=True)
-        work_dir_id = md5(str(Path.cwd()).encode(encoding="utf-8")).hexdigest()
+        work_dir_id = md5(str(KaosPath.cwd()).encode(encoding="utf-8")).hexdigest()
         self._history_file = (history_dir / work_dir_id).with_suffix(".jsonl")
         self._status_provider = status_provider
         self._model_capabilities = model_capabilities
@@ -474,7 +497,8 @@ class CustomPromptSession:
         self._agent_mode_completer = merge_completers(
             [
                 MetaCommandCompleter(),
-                FileMentionCompleter(Path.cwd()),
+                # TODO(kaos): we need an async KaosFileMentionCompleter
+                LocalFileMentionCompleter(KaosPath.cwd().unsafe_to_local_path()),
             ],
             deduplicate=True,
         )
@@ -549,12 +573,19 @@ class CustomPromptSession:
             message=self._render_message,
             # prompt_continuation=FormattedText([("fg:#4d4d4d", "... ")]),
             completer=self._agent_mode_completer,
-            complete_while_typing=True,
+            complete_while_typing=Condition(lambda: self._mode == PromptMode.AGENT),
             key_bindings=_kb,
             clipboard=clipboard,
             history=history,
             bottom_toolbar=self._render_bottom_toolbar,
         )
+
+        # Allow completion to be triggered when the text is changed,
+        # such as when backspace is used to delete text.
+        @self._session.default_buffer.on_text_changed.add_handler
+        def trigger_complete(buffer: Buffer) -> None:
+            if buffer.complete_while_typing():
+                buffer.start_completion()
 
         self._status_refresh_task: asyncio.Task | None = None
 
@@ -562,7 +593,7 @@ class CustomPromptSession:
         symbol = PROMPT_SYMBOL if self._mode == PromptMode.AGENT else PROMPT_SYMBOL_SHELL
         if self._mode == PromptMode.AGENT and self._thinking:
             symbol = PROMPT_SYMBOL_THINKING
-        return FormattedText([("bold", f"{getpass.getuser()}{symbol} ")])
+        return FormattedText([("bold", f"{getpass.getuser()}@{KaosPath.cwd().name}{symbol} ")])
 
     def _apply_mode(self, event: KeyPressEvent | None = None) -> None:
         # Apply mode to the active buffer (not the PromptSession itself)
@@ -578,13 +609,11 @@ class CustomPromptSession:
                     buff.cancel_completion()
             if buff is not None:
                 buff.completer = DummyCompleter()
-                buff.complete_while_typing = Never()
         else:
             if buff is not None:
                 buff.completer = self._agent_mode_completer
-                buff.complete_while_typing = Always()
 
-    def __enter__(self) -> "CustomPromptSession":
+    def __enter__(self) -> CustomPromptSession:
         if self._status_refresh_task is not None and not self._status_refresh_task.done():
             return self
 

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import asyncio
 from collections.abc import Sequence
 from functools import partial
@@ -6,14 +8,15 @@ from typing import TYPE_CHECKING
 import kosong
 import tenacity
 from kosong import StepResult
-from kosong.base.chat_provider import ThinkingEffort
-from kosong.base.message import ContentPart, ImageURLPart, Message
 from kosong.chat_provider import (
     APIConnectionError,
+    APIEmptyResponseError,
     APIStatusError,
     APITimeoutError,
     ChatProviderError,
+    ThinkingEffort,
 )
+from kosong.message import ContentPart, Message
 from kosong.tooling import ToolResult
 from tenacity import RetryCallState, retry_if_exception, stop_after_attempt, wait_exponential_jitter
 
@@ -29,8 +32,7 @@ from kimi_cli.soul import (
 from kimi_cli.soul.agent import Agent
 from kimi_cli.soul.compaction import SimpleCompaction
 from kimi_cli.soul.context import Context
-from kimi_cli.soul.message import system, tool_result_to_messages
-from kimi_cli.soul.runtime import Runtime
+from kimi_cli.soul.message import check_message, system, tool_result_to_message
 from kimi_cli.tools.dmail import NAME as SendDMail_NAME
 from kimi_cli.tools.utils import ToolRejectedError
 from kimi_cli.utils.logging import logger
@@ -42,6 +44,12 @@ from kimi_cli.wire.message import (
     StepInterrupted,
 )
 
+if TYPE_CHECKING:
+
+    def type_check(soul: KimiSoul):
+        _: Soul = soul
+
+
 RESERVED_TOKENS = 50_000
 
 
@@ -51,7 +59,6 @@ class KimiSoul(Soul):
     def __init__(
         self,
         agent: Agent,
-        runtime: Runtime,
         *,
         context: Context,
     ):
@@ -60,15 +67,14 @@ class KimiSoul(Soul):
 
         Args:
             agent (Agent): The agent to run.
-            runtime (Runtime): Runtime parameters and states.
             context (Context): The context of the agent.
         """
         self._agent = agent
-        self._runtime = runtime
-        self._denwa_renji = runtime.denwa_renji
-        self._approval = runtime.approval
+        self._runtime = agent.runtime
+        self._denwa_renji = agent.runtime.denwa_renji
+        self._approval = agent.runtime.approval
         self._context = context
-        self._loop_control = runtime.config.loop_control
+        self._loop_control = agent.runtime.config.loop_control
         self._compaction = SimpleCompaction()  # TODO: maybe configurable and composable
         self._reserved_tokens = RESERVED_TOKENS
         if self._runtime.llm is not None:
@@ -136,15 +142,12 @@ class KimiSoul(Soul):
         if self._runtime.llm is None:
             raise LLMNotSet()
 
-        if (
-            isinstance(user_input, list)
-            and any(isinstance(part, ImageURLPart) for part in user_input)
-            and "image_in" not in self._runtime.llm.capabilities
-        ):
-            raise LLMNotSupported(self._runtime.llm, ["image_in"])
+        user_message = Message(role="user", content=user_input)
+        if missing_caps := check_message(user_message, self._runtime.llm.capabilities):
+            raise LLMNotSupported(self._runtime.llm, list(missing_caps))
 
         await self._checkpoint()  # this creates the checkpoint 0 on first run
-        await self._context.append_message(Message(role="user", content=user_input))
+        await self._context.append_message(user_message)
         logger.debug("Appended user message to context")
         await self._agent_loop()
 
@@ -159,7 +162,7 @@ class KimiSoul(Soul):
 
         step_no = 1
         while True:
-            wire_send(StepBegin(step_no))
+            wire_send(StepBegin(n=step_no))
             approval_task = asyncio.create_task(_pipe_approval_to_wire())
             # FIXME: It's possible that a subagent's approval task steals approval request
             # from the main agent. We must ensure that the Task tool will redirect them
@@ -272,14 +275,26 @@ class KimiSoul(Soul):
 
     async def _grow_context(self, result: StepResult, tool_results: list[ToolResult]):
         logger.debug("Growing context with result: {result}", result=result)
+
+        assert self._runtime.llm is not None
+        tool_messages = [tool_result_to_message(tr) for tr in tool_results]
+        for tm in tool_messages:
+            if missing_caps := check_message(tm, self._runtime.llm.capabilities):
+                logger.warning(
+                    "Tool result message requires unsupported capabilities: {caps}",
+                    caps=missing_caps,
+                )
+                raise LLMNotSupported(self._runtime.llm, list(missing_caps))
+
         await self._context.append_message(result.message)
         if result.usage is not None:
             await self._context.update_token_count(result.usage.total)
 
+        logger.debug(
+            "Appending tool messages to context: {tool_messages}", tool_messages=tool_messages
+        )
+        await self._context.append_message(tool_messages)
         # token count of tool results are not available yet
-        for tool_result in tool_results:
-            logger.debug("Appending tool result to context: {tool_result}", tool_result=tool_result)
-            await self._context.append_message(tool_result_to_messages(tool_result))
 
     async def compact_context(self) -> None:
         """
@@ -309,7 +324,7 @@ class KimiSoul(Soul):
 
     @staticmethod
     def _is_retryable_error(exception: BaseException) -> bool:
-        if isinstance(exception, (APIConnectionError, APITimeoutError)):
+        if isinstance(exception, (APIConnectionError, APITimeoutError, APIEmptyResponseError)):
             return True
         return isinstance(exception, APIStatusError) and exception.status_code in (
             429,  # Too Many Requests
@@ -339,9 +354,3 @@ class BackToTheFuture(Exception):
     def __init__(self, checkpoint_id: int, messages: Sequence[Message]):
         self.checkpoint_id = checkpoint_id
         self.messages = messages
-
-
-if TYPE_CHECKING:
-
-    def type_check(kimi_soul: KimiSoul):
-        _: Soul = kimi_soul

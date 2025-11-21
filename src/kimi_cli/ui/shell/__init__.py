@@ -1,11 +1,14 @@
+from __future__ import annotations
+
 import asyncio
+import shlex
 from collections.abc import Awaitable, Coroutine
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any
 
-from kosong.base.message import ContentPart
 from kosong.chat_provider import APIStatusError, ChatProviderError
+from kosong.message import ContentPart
 from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.table import Table
@@ -25,7 +28,7 @@ from kimi_cli.utils.term import ensure_new_line
 
 
 class ShellApp:
-    def __init__(self, soul: Soul, welcome_info: list["WelcomeInfoItem"] | None = None):
+    def __init__(self, soul: Soul, welcome_info: list[WelcomeInfoItem] | None = None):
         self.soul = soul
         self._welcome_info = list(welcome_info or [])
         self._background_tasks: set[asyncio.Task[Any]] = set()
@@ -92,6 +95,16 @@ class ShellApp:
     async def _run_shell_command(self, command: str) -> None:
         """Run a shell command in foreground."""
         if not command.strip():
+            return
+
+        # Check if user is trying to use 'cd' command
+        stripped_cmd = command.strip()
+        split_cmd = shlex.split(stripped_cmd)
+        if len(split_cmd) == 2 and split_cmd[0] == "cd":
+            console.print(
+                "[yellow]Warning: Directory changes are not preserved across command executions."
+                "[/yellow]"
+            )
             return
 
         logger.info("Running shell command: {cmd}", cmd=command)
@@ -227,14 +240,18 @@ class ShellApp:
         return False
 
     async def _auto_update(self) -> None:
-        toast("checking for updates...", duration=2.0)
+        toast("checking for updates...", topic="update", duration=2.0)
         result = await do_update(print=False, check_only=True)
         if result == UpdateResult.UPDATE_AVAILABLE:
             while True:
-                toast("new version found, run `uv tool upgrade kimi-cli` to upgrade", duration=30.0)
+                toast(
+                    "new version found, run `uv tool upgrade kimi-cli` to upgrade",
+                    topic="update",
+                    duration=30.0,
+                )
                 await asyncio.sleep(60.0)
         elif result == UpdateResult.UPDATED:
-            toast("auto updated, restart to use the new version", duration=5.0)
+            toast("auto updated, restart to use the new version", topic="update", duration=5.0)
 
     def _start_background_task(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
         task = asyncio.create_task(coro)
