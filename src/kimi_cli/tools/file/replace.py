@@ -1,14 +1,17 @@
 from pathlib import Path
-from typing import Any, override
-
-from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnType
-from pydantic import BaseModel, Field
+from typing import override
 
 from kaos.path import KaosPath
+from kosong.tooling import CallableTool2, ToolError, ToolReturnValue
+from pydantic import BaseModel, Field
+
 from kimi_cli.soul.agent import BuiltinSystemPromptArgs
 from kimi_cli.soul.approval import Approval
+from kimi_cli.tools.display import DisplayBlock
 from kimi_cli.tools.file import FileActions
 from kimi_cli.tools.utils import ToolRejectedError, load_desc
+from kimi_cli.utils.diff import build_diff_blocks
+from kimi_cli.utils.path import is_within_directory
 
 
 class Edit(BaseModel):
@@ -18,7 +21,12 @@ class Edit(BaseModel):
 
 
 class Params(BaseModel):
-    path: str = Field(description="The absolute path to the file to edit.")
+    path: str = Field(
+        description=(
+            "The path to the file to edit. Absolute paths are required when editing files "
+            "outside the working directory."
+        )
+    )
     edit: Edit | list[Edit] = Field(
         description=(
             "The edit(s) to apply to the file. "
@@ -32,24 +40,23 @@ class StrReplaceFile(CallableTool2[Params]):
     description: str = load_desc(Path(__file__).parent / "replace.md")
     params: type[Params] = Params
 
-    def __init__(self, builtin_args: BuiltinSystemPromptArgs, approval: Approval, **kwargs: Any):
-        super().__init__(**kwargs)
+    def __init__(self, builtin_args: BuiltinSystemPromptArgs, approval: Approval):
+        super().__init__()
         self._work_dir = builtin_args.KIMI_WORK_DIR
         self._approval = approval
 
     async def _validate_path(self, path: KaosPath) -> ToolError | None:
         """Validate that the path is safe to edit."""
-        # Check for path traversal attempts
         resolved_path = path.canonical()
 
-        # Ensure the path is within work directory
-        if not str(resolved_path).startswith(str(self._work_dir)):
+        if not is_within_directory(resolved_path, self._work_dir) and not path.is_absolute():
             return ToolError(
                 message=(
-                    f"`{path}` is outside the working directory. "
-                    "You can only edit files within the working directory."
+                    f"`{path}` is not an absolute path. "
+                    "You must provide an absolute path to edit a file "
+                    "outside the working directory."
                 ),
-                brief="Path outside working directory",
+                brief="Invalid path",
             )
         return None
 
@@ -61,23 +68,18 @@ class StrReplaceFile(CallableTool2[Params]):
             return content.replace(edit.old, edit.new, 1)
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
+        if not params.path:
+            return ToolError(
+                message="File path cannot be empty.",
+                brief="Empty file path",
+            )
+
         try:
-            p = KaosPath(params.path)
-
-            if not p.is_absolute():
-                return ToolError(
-                    message=(
-                        f"`{params.path}` is not an absolute path. "
-                        "You must provide an absolute path to edit a file."
-                    ),
-                    brief="Invalid path",
-                )
-
-            # Validate path safety
-            path_error = await self._validate_path(p)
-            if path_error:
-                return path_error
+            p = KaosPath(params.path).expanduser()
+            if err := await self._validate_path(p):
+                return err
+            p = p.canonical()
 
             if not await p.exists():
                 return ToolError(
@@ -89,14 +91,6 @@ class StrReplaceFile(CallableTool2[Params]):
                     message=f"`{params.path}` is not a file.",
                     brief="Invalid path",
                 )
-
-            # Request approval
-            if not await self._approval.request(
-                self.name,
-                FileActions.EDIT,
-                f"Edit file `{params.path}`",
-            ):
-                return ToolRejectedError()
 
             # Read the file content
             content = await p.read_text(errors="replace")
@@ -115,6 +109,25 @@ class StrReplaceFile(CallableTool2[Params]):
                     brief="No replacements made",
                 )
 
+            diff_blocks: list[DisplayBlock] = list(
+                build_diff_blocks(str(p), original_content, content)
+            )
+
+            action = (
+                FileActions.EDIT
+                if is_within_directory(p, self._work_dir)
+                else FileActions.EDIT_OUTSIDE
+            )
+
+            # Request approval
+            if not await self._approval.request(
+                self.name,
+                action,
+                f"Edit file `{p}`",
+                display=diff_blocks,
+            ):
+                return ToolRejectedError()
+
             # Write the modified content back to the file
             await p.write_text(content, errors="replace")
 
@@ -126,12 +139,14 @@ class StrReplaceFile(CallableTool2[Params]):
                 else:
                     total_replacements += 1 if edit.old in original_content else 0
 
-            return ToolOk(
+            return ToolReturnValue(
+                is_error=False,
                 output="",
                 message=(
                     f"File successfully edited. "
                     f"Applied {len(edits)} edit(s) with {total_replacements} total replacement(s)."
                 ),
+                display=diff_blocks,
             )
 
         except Exception as e:

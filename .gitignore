@@ -23,3 +23,15 @@ src/kimi_cli/deps/tmp
 
 # Generated reports
 tests_ai/report.json
+
+# nix build result
+result
+result-*
+
+# macOS files
+.DS_Store
+
+
+node_modules/
+static/
+.memo/

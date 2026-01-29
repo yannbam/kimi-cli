@@ -2,45 +2,67 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager, suppress
 from typing import NamedTuple
 
-import streamingjson  # pyright: ignore[reportMissingTypeStubs]
-from kosong.message import ContentPart, TextPart, ThinkPart, ToolCall, ToolCallPart
-from kosong.tooling import ToolError, ToolOk, ToolResult, ToolReturnType
+import streamingjson  # type: ignore[reportMissingTypeStubs]
+from kosong.message import Message
+from kosong.tooling import ToolError, ToolOk
 from rich.console import Group, RenderableType
 from rich.live import Live
 from rich.markup import escape
+from rich.padding import Padding
 from rich.panel import Panel
 from rich.spinner import Spinner
 from rich.text import Text
 
-from kimi_cli.soul import StatusSnapshot
 from kimi_cli.tools import extract_key_argument
 from kimi_cli.ui.shell.console import console
-from kimi_cli.ui.shell.keyboard import KeyEvent, listen_for_keyboard
+from kimi_cli.ui.shell.keyboard import KeyboardListener, KeyEvent
+from kimi_cli.utils.aioqueue import QueueShutDown
+from kimi_cli.utils.diff import format_unified_diff
+from kimi_cli.utils.logging import logger
+from kimi_cli.utils.message import message_stringify
 from kimi_cli.utils.rich.columns import BulletColumns
 from kimi_cli.utils.rich.markdown import Markdown
-from kimi_cli.wire import WireMessage, WireUISide
-from kimi_cli.wire.message import (
+from kimi_cli.utils.rich.syntax import KimiSyntax
+from kimi_cli.wire import WireUISide
+from kimi_cli.wire.types import (
     ApprovalRequest,
     ApprovalResponse,
+    BriefDisplayBlock,
     CompactionBegin,
     CompactionEnd,
+    ContentPart,
+    DiffDisplayBlock,
+    ShellDisplayBlock,
     StatusUpdate,
     StepBegin,
     StepInterrupted,
     SubagentEvent,
+    TextPart,
+    ThinkPart,
+    TodoDisplayBlock,
+    ToolCall,
+    ToolCallPart,
+    ToolCallRequest,
+    ToolResult,
+    ToolReturnValue,
+    TurnBegin,
+    WireMessage,
 )
 
 MAX_SUBAGENT_TOOL_CALLS_TO_SHOW = 4
+
+# Truncation limits for approval request display
+MAX_PREVIEW_LINES = 4
 
 
 async def visualize(
     wire: WireUISide,
     *,
-    initial_status: StatusSnapshot,
+    initial_status: StatusUpdate,
     cancel_event: asyncio.Event | None = None,
 ):
     """
@@ -70,7 +92,7 @@ class _ContentBlock:
                 self.raw_text,
                 style="grey50 italic" if self.is_think else "",
             ),
-            bullet_style="grey50",
+            bullet_style="grey50" if self.is_think else None,
         )
 
     def append(self, content: str) -> None:
@@ -80,7 +102,7 @@ class _ContentBlock:
 class _ToolCallBlock:
     class FinishedSubCall(NamedTuple):
         call: ToolCall
-        result: ToolReturnType
+        result: ToolReturnValue
 
     def __init__(self, tool_call: ToolCall):
         self._tool_name = tool_call.function.name
@@ -89,7 +111,7 @@ class _ToolCallBlock:
             self._lexer.append_string(tool_call.function.arguments)
 
         self._argument = extract_key_argument(self._lexer, self._tool_name)
-        self._result: ToolReturnType | None = None
+        self._result: ToolReturnValue | None = None
 
         self._ongoing_subagent_tool_calls: dict[str, ToolCall] = {}
         self._last_subagent_tool_call: ToolCall | None = None
@@ -121,7 +143,7 @@ class _ToolCallBlock:
                 bullet=self._spinning_dots,
             )
 
-    def finish(self, result: ToolReturnType):
+    def finish(self, result: ToolReturnValue):
         self._result = result
         self._renderable = self._compose()
 
@@ -148,7 +170,7 @@ class _ToolCallBlock:
         self._finished_subagent_tool_calls.append(
             _ToolCallBlock.FinishedSubCall(
                 call=sub_tool_call,
-                result=tool_result.result,
+                result=tool_result.return_value,
             )
         )
         self._n_finished_subagent_tool_calls += 1
@@ -180,22 +202,26 @@ class _ToolCallBlock:
                         f"Used [blue]{sub_call.function.name}[/blue]"
                         + (f" [grey50]({argument})[/grey50]" if argument else "")
                     ),
-                    bullet_style="green" if isinstance(sub_result, ToolOk) else "red",
+                    bullet_style="green" if not sub_result.is_error else "red",
                 )
             )
 
-        if self._result is not None and self._result.brief:
-            lines.append(
-                Markdown(
-                    self._result.brief,
-                    style="grey50" if isinstance(self._result, ToolOk) else "red",
-                )
-            )
+        if self._result is not None:
+            for block in self._result.display:
+                if isinstance(block, BriefDisplayBlock):
+                    style = "grey50" if not self._result.is_error else "red"
+                    if block.text:
+                        lines.append(Markdown(block.text, style=style))
+                elif isinstance(block, TodoDisplayBlock):
+                    markdown = self._render_todo_markdown(block)
+                    if markdown:
+                        lines.append(Markdown(markdown, style="grey50"))
 
         if self.finished:
+            assert self._result is not None
             return BulletColumns(
                 Group(*lines),
-                bullet_style="green" if isinstance(self._result, ToolOk) else "red",
+                bullet_style="green" if not self._result.is_error else "red",
             )
         else:
             return BulletColumns(
@@ -208,45 +234,148 @@ class _ToolCallBlock:
             f" [grey50]({escape(self._argument)})[/grey50]" if self._argument else ""
         )
 
+    def _render_todo_markdown(self, block: TodoDisplayBlock) -> str:
+        lines: list[str] = []
+        for todo in block.items:
+            normalized = todo.status.replace("_", " ").lower()
+            match normalized:
+                case "pending":
+                    lines.append(f"- {todo.title}")
+                case "in progress":
+                    lines.append(f"- {todo.title} ←")
+                case "done":
+                    lines.append(f"- ~~{todo.title}~~")
+                case _:
+                    lines.append(f"- {todo.title}")
+        return "\n".join(lines)
+
+
+class _ApprovalContentBlock(NamedTuple):
+    """A pre-rendered content block for approval request with line count."""
+
+    text: str
+    lines: int
+    style: str = ""
+    lexer: str = ""
+
 
 class _ApprovalRequestPanel:
     def __init__(self, request: ApprovalRequest):
         self.request = request
-        self.options = [
-            ("Approve once", ApprovalResponse.APPROVE),
-            ("Approve for this session", ApprovalResponse.APPROVE_FOR_SESSION),
-            ("Reject, tell Kimi CLI what to do instead", ApprovalResponse.REJECT),
+        self.options: list[tuple[str, ApprovalResponse.Kind]] = [
+            ("Approve once", "approve"),
+            ("Approve for this session", "approve_for_session"),
+            ("Reject, tell Kimi what to do instead", "reject"),
         ]
         self.selected_index = 0
 
+        # Pre-render all content blocks with line counts
+        self._content_blocks: list[_ApprovalContentBlock] = []
+        last_diff_path: str | None = None
+
+        # Handle description (only if no display blocks)
+        if request.description and not request.display:
+            text = request.description.rstrip("\n")
+            self._content_blocks.append(
+                _ApprovalContentBlock(text=text, lines=text.count("\n") + 1)
+            )
+
+        # Handle display blocks
+        for block in request.display:
+            if isinstance(block, DiffDisplayBlock):
+                # File path or ellipsis
+                if block.path != last_diff_path:
+                    self._content_blocks.append(
+                        _ApprovalContentBlock(text=block.path, lines=1, style="bold")
+                    )
+                    last_diff_path = block.path
+                else:
+                    self._content_blocks.append(
+                        _ApprovalContentBlock(text="⋮", lines=1, style="dim")
+                    )
+                # Diff content
+                diff_text = format_unified_diff(
+                    block.old_text,
+                    block.new_text,
+                    block.path,
+                    include_file_header=False,
+                ).rstrip("\n")
+                self._content_blocks.append(
+                    _ApprovalContentBlock(
+                        text=diff_text, lines=diff_text.count("\n") + 1, lexer="diff"
+                    )
+                )
+            elif isinstance(block, ShellDisplayBlock):
+                text = block.command.rstrip("\n")
+                self._content_blocks.append(
+                    _ApprovalContentBlock(
+                        text=text, lines=text.count("\n") + 1, lexer=block.language
+                    )
+                )
+                last_diff_path = None
+            elif isinstance(block, BriefDisplayBlock) and block.text:
+                text = block.text.rstrip("\n")
+                self._content_blocks.append(
+                    _ApprovalContentBlock(text=text, lines=text.count("\n") + 1, style="grey50")
+                )
+                last_diff_path = None
+
+        self._total_lines = sum(b.lines for b in self._content_blocks)
+        self.has_expandable_content = self._total_lines > MAX_PREVIEW_LINES
+
     def render(self) -> RenderableType:
         """Render the approval menu as a panel."""
-        lines: list[RenderableType] = []
-
-        # Add request details
-        lines.append(
-            Text.assemble(
-                Text.from_markup(f"[blue]{self.request.sender}[/blue]"),
-                Text(f' is requesting approval to "{self.request.description}".'),
+        content_lines: list[RenderableType] = [
+            Text.from_markup(
+                "[yellow]⚠ "
+                f"{escape(self.request.sender)} is requesting approval to "
+                f"{escape(self.request.action)}:[/yellow]"
             )
-        )
+        ]
+        content_lines.append(Text(""))
 
-        lines.append(Text(""))  # Empty line
+        # Render content with line budget
+        remaining = MAX_PREVIEW_LINES
+        for block in self._content_blocks:
+            if remaining <= 0:
+                break
+            content_lines.append(self._render_block(block, remaining))
+            remaining -= min(block.lines, remaining)
+
+        if self.has_expandable_content:
+            content_lines.append(Text("... (truncated, ctrl-e to expand)", style="dim italic"))
+
+        lines: list[RenderableType] = []
+        if content_lines:
+            lines.append(Padding(Group(*content_lines), (0, 0, 0, 2)))
 
         # Add menu options
+        if lines:
+            lines.append(Text(""))
         for i, (option_text, _) in enumerate(self.options):
             if i == self.selected_index:
                 lines.append(Text(f"→ {option_text}", style="cyan"))
             else:
                 lines.append(Text(f"  {option_text}", style="grey50"))
 
-        content = Group(*lines)
-        return Panel.fit(
-            content,
-            title="[yellow]⚠ Approval Requested[/yellow]",
-            border_style="yellow",
-            padding=(1, 2),
-        )
+        return Padding(Group(*lines), 1)
+
+    def _render_block(
+        self, block: _ApprovalContentBlock, max_lines: int | None = None
+    ) -> RenderableType:
+        """Render a content block, optionally truncated."""
+        text = block.text
+        if max_lines is not None and block.lines > max_lines:
+            # Truncate to max_lines
+            text = "\n".join(text.split("\n")[:max_lines])
+
+        if block.lexer:
+            return KimiSyntax(text, block.lexer)
+        return Text(text, style=block.style)
+
+    def render_full(self) -> list[RenderableType]:
+        """Render full content for pager (no truncation)."""
+        return [self._render_block(block) for block in self._content_blocks]
 
     def move_up(self):
         """Move selection up."""
@@ -256,28 +385,53 @@ class _ApprovalRequestPanel:
         """Move selection down."""
         self.selected_index = (self.selected_index + 1) % len(self.options)
 
-    def get_selected_response(self) -> ApprovalResponse:
+    def get_selected_response(self) -> ApprovalResponse.Kind:
         """Get the approval response based on selected option."""
         return self.options[self.selected_index][1]
 
 
+def _show_approval_in_pager(panel: _ApprovalRequestPanel) -> None:
+    """Show the full approval request content in a pager."""
+    with console.screen(), console.pager(styles=True):
+        # Header: matches the style in _ApprovalRequestPanel.render()
+        console.print(
+            Text.from_markup(
+                "[yellow]⚠ "
+                f"{escape(panel.request.sender)} is requesting approval to "
+                f"{escape(panel.request.action)}:[/yellow]"
+            )
+        )
+        console.print()
+
+        # Render full content (no truncation)
+        for renderable in panel.render_full():
+            console.print(renderable)
+
+
 class _StatusBlock:
-    def __init__(self, initial: StatusSnapshot) -> None:
-        self.text = Text("", justify="right", style="grey50")
+    def __init__(self, initial: StatusUpdate) -> None:
+        self.text = Text("", justify="right")
         self.update(initial)
 
     def render(self) -> RenderableType:
         return self.text
 
-    def update(self, status: StatusSnapshot) -> None:
-        self.text.plain = f"context: {status.context_usage:.1%}"
+    def update(self, status: StatusUpdate) -> None:
+        if status.context_usage is not None:
+            self.text.plain = f"context: {status.context_usage:.1%}"
 
 
 @asynccontextmanager
-async def _keyboard_listener(handler: Callable[[KeyEvent], None]):
+async def _keyboard_listener(
+    handler: Callable[[KeyboardListener, KeyEvent], Awaitable[None]],
+):
+    listener = KeyboardListener()
+    await listener.start()
+
     async def _keyboard():
-        async for event in listen_for_keyboard():
-            handler(event)
+        while True:
+            event = await listener.get()
+            await handler(listener, event)
 
     task = asyncio.create_task(_keyboard())
     try:
@@ -286,10 +440,11 @@ async def _keyboard_listener(handler: Callable[[KeyEvent], None]):
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
+        await listener.stop()
 
 
 class _LiveView:
-    def __init__(self, initial_status: StatusSnapshot, cancel_event: asyncio.Event | None = None):
+    def __init__(self, initial_status: StatusUpdate, cancel_event: asyncio.Event | None = None):
         self._cancel_event = cancel_event
 
         self._mooning_spinner: Spinner | None = None
@@ -299,11 +454,21 @@ class _LiveView:
         self._tool_call_blocks: dict[str, _ToolCallBlock] = {}
         self._last_tool_call_block: _ToolCallBlock | None = None
         self._approval_request_queue = deque[ApprovalRequest]()
+        """
+        It is possible that multiple subagents request approvals at the same time,
+        in which case we will have to queue them up and show them one by one.
+        """
         self._current_approval_request_panel: _ApprovalRequestPanel | None = None
         self._reject_all_following = False
         self._status_block = _StatusBlock(initial_status)
 
         self._need_recompose = False
+
+    def _reset_live_shape(self, live: Live) -> None:
+        # Rich doesn't expose a public API to clear Live's cached render height.
+        # After leaving the pager, stale height causes cursor restores to jump,
+        # so we reset the private _shape to re-anchor the next refresh.
+        live._live_render._shape = None  # type: ignore[reportPrivateUsage]
 
     async def visualize_loop(self, wire: WireUISide):
         with Live(
@@ -314,29 +479,47 @@ class _LiveView:
             vertical_overflow="visible",
         ) as live:
 
-            def keyboard_handler(event: KeyEvent) -> None:
+            async def keyboard_handler(listener: KeyboardListener, event: KeyEvent) -> None:
+                # Handle Ctrl+E specially - pause Live while the pager is active
+                if event == KeyEvent.CTRL_E:
+                    if (
+                        self._current_approval_request_panel
+                        and self._current_approval_request_panel.has_expandable_content
+                    ):
+                        await listener.pause()
+                        live.stop()
+                        try:
+                            _show_approval_in_pager(self._current_approval_request_panel)
+                        finally:
+                            # Reset live render shape so the next refresh re-anchors cleanly.
+                            self._reset_live_shape(live)
+                            live.start()
+                            live.update(self.compose(), refresh=True)
+                            await listener.resume()
+                    return
+
                 self.dispatch_keyboard_event(event)
                 if self._need_recompose:
-                    live.update(self.compose())
+                    live.update(self.compose(), refresh=True)
                     self._need_recompose = False
 
             async with _keyboard_listener(keyboard_handler):
                 while True:
                     try:
                         msg = await wire.receive()
-                    except asyncio.QueueShutDown:
+                    except QueueShutDown:
                         self.cleanup(is_interrupt=False)
-                        live.update(self.compose())
+                        live.update(self.compose(), refresh=True)
                         break
 
                     if isinstance(msg, StepInterrupted):
                         self.cleanup(is_interrupt=True)
-                        live.update(self.compose())
+                        live.update(self.compose(), refresh=True)
                         break
 
                     self.dispatch_wire_message(msg)
                     if self._need_recompose:
-                        live.update(self.compose())
+                        live.update(self.compose(), refresh=True)
                         self._need_recompose = False
 
     def refresh_soon(self) -> None:
@@ -370,18 +553,27 @@ class _LiveView:
             return
 
         if self._mooning_spinner is not None:
+            # any message other than StepBegin should end the mooning state
             self._mooning_spinner = None
             self.refresh_soon()
 
         match msg:
+            case TurnBegin():
+                self.flush_content()
+                console.print(
+                    Panel(
+                        Text(message_stringify(Message(role="user", content=msg.user_input))),
+                        padding=(0, 1),
+                    )
+                )
             case CompactionBegin():
                 self._compacting_spinner = Spinner("balloon", "Compacting...")
                 self.refresh_soon()
             case CompactionEnd():
                 self._compacting_spinner = None
                 self.refresh_soon()
-            case StatusUpdate(status=status):
-                self._status_block.update(status)
+            case StatusUpdate():
+                self._status_block.update(msg)
             case ContentPart():
                 self.append_content(msg)
             case ToolCall():
@@ -390,10 +582,15 @@ class _LiveView:
                 self.append_tool_call_part(msg)
             case ToolResult():
                 self.append_tool_result(msg)
-            case ApprovalRequest():
-                self.request_approval(msg)
+            case ApprovalResponse():
+                # we don't need to handle this because the request is resolved on UI
+                pass
             case SubagentEvent():
                 self.handle_subagent_event(msg)
+            case ApprovalRequest():
+                self.request_approval(msg)
+            case ToolCallRequest():
+                logger.warning("Unexpected ToolCallRequest in shell UI: {msg}", msg=msg)
 
     def dispatch_keyboard_event(self, event: KeyEvent) -> None:
         # handle ESC key to cancel the run
@@ -415,19 +612,19 @@ class _LiveView:
             case KeyEvent.ENTER:
                 resp = self._current_approval_request_panel.get_selected_response()
                 self._current_approval_request_panel.request.resolve(resp)
-                if resp == ApprovalResponse.APPROVE_FOR_SESSION:
+                if resp == "approve_for_session":
                     to_remove_from_queue: list[ApprovalRequest] = []
                     for request in self._approval_request_queue:
                         # approve all queued requests with the same action
                         if request.action == self._current_approval_request_panel.request.action:
-                            request.resolve(ApprovalResponse.APPROVE_FOR_SESSION)
+                            request.resolve("approve_for_session")
                             to_remove_from_queue.append(request)
                     for request in to_remove_from_queue:
                         self._approval_request_queue.remove(request)
-                elif resp == ApprovalResponse.REJECT:
+                elif resp == "reject":
                     # one rejection should stop the step immediately
                     while self._approval_request_queue:
-                        self._approval_request_queue.popleft().resolve(ApprovalResponse.REJECT)
+                        self._approval_request_queue.popleft().resolve("reject")
                     self._reject_all_following = True
                 self.show_next_approval_request()
             case _:
@@ -451,7 +648,7 @@ class _LiveView:
 
         while self._approval_request_queue:
             # should not happen, but just in case
-            self._approval_request_queue.popleft().resolve(ApprovalResponse.REJECT)
+            self._approval_request_queue.popleft().resolve("reject")
         self._current_approval_request_panel = None
         self._reject_all_following = False
 
@@ -510,14 +707,14 @@ class _LiveView:
 
     def append_tool_result(self, result: ToolResult) -> None:
         if block := self._tool_call_blocks.get(result.tool_call_id):
-            block.finish(result.result)
+            block.finish(result.return_value)
             self.flush_finished_tool_calls()
             self.refresh_soon()
 
     def request_approval(self, request: ApprovalRequest) -> None:
         # If we're rejecting all following requests, reject immediately
         if self._reject_all_following:
-            request.resolve(ApprovalResponse.REJECT)
+            request.resolve("reject")
             return
 
         self._approval_request_queue.append(request)

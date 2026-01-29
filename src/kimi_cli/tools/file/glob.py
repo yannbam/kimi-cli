@@ -1,15 +1,15 @@
 """Glob tool implementation."""
 
 from pathlib import Path
-from typing import Any, override
-
-from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnType
-from pydantic import BaseModel, Field
+from typing import override
 
 from kaos.path import KaosPath
+from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnValue
+from pydantic import BaseModel, Field
+
 from kimi_cli.soul.agent import BuiltinSystemPromptArgs
 from kimi_cli.tools.utils import load_desc
-from kimi_cli.utils.path import list_directory
+from kimi_cli.utils.path import is_within_directory, list_directory
 
 MAX_MATCHES = 1000
 
@@ -38,8 +38,8 @@ class Glob(CallableTool2[Params]):
     )
     params: type[Params] = Params
 
-    def __init__(self, builtin_args: BuiltinSystemPromptArgs, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, builtin_args: BuiltinSystemPromptArgs) -> None:
+        super().__init__()
         self._work_dir = builtin_args.KIMI_WORK_DIR
 
     async def _validate_pattern(self, pattern: str) -> ToolError | None:
@@ -64,7 +64,7 @@ class Glob(CallableTool2[Params]):
         resolved_dir = directory.canonical()
 
         # Ensure the directory is within work directory
-        if not str(resolved_dir).startswith(str(self._work_dir)):
+        if not is_within_directory(resolved_dir, self._work_dir):
             return ToolError(
                 message=(
                     f"`{directory}` is outside the working directory. "
@@ -75,7 +75,7 @@ class Glob(CallableTool2[Params]):
         return None
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
         try:
             # Validate pattern safety
             pattern_error = await self._validate_pattern(params.pattern)
@@ -111,7 +111,7 @@ class Glob(CallableTool2[Params]):
 
             # Perform the glob search - users can use ** directly in pattern
             matches: list[KaosPath] = []
-            async for match in await dir_path.glob(params.pattern):
+            async for match in dir_path.glob(params.pattern):
                 matches.append(match)
 
             # Filter out directories if not requested

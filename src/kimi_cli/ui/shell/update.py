@@ -196,17 +196,17 @@ async def _do_update(*, print: bool, check_only: bool) -> UpdateResult:
                 return UpdateResult.FAILED
 
     _print("[green]Updated successfully![/green]")
-    _print("[yellow]Restart Kimi CLI to use the new version.[/yellow]")
+    _print("[yellow]Restart Kimi Code CLI to use the new version.[/yellow]")
     return UpdateResult.UPDATED
 
 
 # @meta_command
-# async def update(app: "ShellApp", args: list[str]):
+# async def update(app: "Shell", args: list[str]):
 #     """Check for updates"""
 #     await do_update(print=True)
 
 
 # @meta_command(name="check-update")
-# async def check_update(app: "ShellApp", args: list[str]):
+# async def check_update(app: "Shell", args: list[str]):
 #     """Check for updates"""
 #     await do_update(print=True, check_only=True)

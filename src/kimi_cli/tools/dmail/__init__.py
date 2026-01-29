@@ -1,7 +1,7 @@
 from pathlib import Path
-from typing import Any, override
+from typing import override
 
-from kosong.tooling import CallableTool2, ToolError, ToolReturnType
+from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnValue
 
 from kimi_cli.soul.denwarenji import DenwaRenji, DenwaRenjiError, DMail
 from kimi_cli.tools.utils import load_desc
@@ -14,12 +14,12 @@ class SendDMail(CallableTool2[DMail]):
     description: str = load_desc(Path(__file__).parent / "dmail.md")
     params: type[DMail] = DMail
 
-    def __init__(self, denwa_renji: DenwaRenji, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, denwa_renji: DenwaRenji) -> None:
+        super().__init__()
         self._denwa_renji = denwa_renji
 
     @override
-    async def __call__(self, params: DMail) -> ToolReturnType:
+    async def __call__(self, params: DMail) -> ToolReturnValue:
         try:
             self._denwa_renji.send_dmail(params)
         except DenwaRenjiError as e:
@@ -28,12 +28,11 @@ class SendDMail(CallableTool2[DMail]):
                 message=f"Failed to send D-Mail. Error: {str(e)}",
                 brief="Failed to send D-Mail",
             )
-        # always return an error because a successful SendDMail call will never return
-        return ToolError(
+        return ToolOk(
             output="",
             message=(
-                "If you see this message, the D-Mail was not sent successfully. "
+                "If you see this message, the D-Mail was NOT sent successfully. "
                 "This may be because some other tool that needs approval was rejected."
             ),
-            brief="D-Mail not sent",
+            brief="El Psy Kongroo",
         )

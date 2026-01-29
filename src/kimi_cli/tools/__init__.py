@@ -1,10 +1,10 @@
 import json
 from typing import cast
 
-import streamingjson  # pyright: ignore[reportMissingTypeStubs]
+import streamingjson  # type: ignore[reportMissingTypeStubs]
+from kaos.path import KaosPath
 from kosong.utils.typing import JsonType
 
-from kaos.path import KaosPath
 from kimi_cli.utils.string import shorten_middle
 
 
@@ -36,7 +36,7 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
                 return None
             key_argument = str(curr_args["name"])
         case "SendDMail":
-            return "El Psy Kongroo"
+            return None
         case "Think":
             if not isinstance(curr_args, dict) or not curr_args.get("thought"):
                 return None
@@ -48,6 +48,10 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
                 return None
             key_argument = str(curr_args["command"])
         case "ReadFile":
+            if not isinstance(curr_args, dict) or not curr_args.get("path"):
+                return None
+            key_argument = _normalize_path(str(curr_args["path"]))
+        case "ReadMediaFile":
             if not isinstance(curr_args, dict) or not curr_args.get("path"):
                 return None
             key_argument = _normalize_path(str(curr_args["path"]))
@@ -78,7 +82,7 @@ def extract_key_argument(json_content: str | streamingjson.Lexer, tool_name: str
         case _:
             if isinstance(json_content, streamingjson.Lexer):
                 # lexer.json_content is list[str] based on streamingjson source code
-                content: list[str] = cast(list[str], json_content.json_content)  # pyright: ignore[reportUnknownMemberType]
+                content: list[str] = cast(list[str], json_content.json_content)  # type: ignore[reportUnknownMemberType]
                 key_argument = "".join(content)
             else:
                 key_argument = json_content

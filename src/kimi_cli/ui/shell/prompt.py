@@ -2,68 +2,96 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import contextlib
 import getpass
 import json
+import mimetypes
 import os
 import re
 import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from hashlib import md5
+from hashlib import md5, sha256
 from io import BytesIO
 from pathlib import Path
-from typing import override
+from typing import Any, Literal, override
 
-from kosong.message import ContentPart, ImageURLPart, TextPart
-from PIL import Image, ImageGrab
+from kaos.path import KaosPath
+from PIL import Image
 from prompt_toolkit import PromptSession
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.clipboard.pyperclip import PyperclipClipboard
 from prompt_toolkit.completion import (
+    CompleteEvent,
     Completer,
     Completion,
-    DummyCompleter,
     FuzzyCompleter,
     WordCompleter,
     merge_completers,
 )
 from prompt_toolkit.document import Document
-from prompt_toolkit.filters import Condition, has_completions
+from prompt_toolkit.filters import has_completions
 from prompt_toolkit.formatted_text import FormattedText
 from prompt_toolkit.history import InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings, KeyPressEvent
 from prompt_toolkit.patch_stdout import patch_stdout
+from prompt_toolkit.styles import Style
 from pydantic import BaseModel, ValidationError
 
-from kaos.path import KaosPath
 from kimi_cli.llm import ModelCapability
 from kimi_cli.share import get_share_dir
 from kimi_cli.soul import StatusSnapshot
 from kimi_cli.ui.shell.console import console
-from kimi_cli.ui.shell.metacmd import get_meta_commands
-from kimi_cli.utils.clipboard import is_clipboard_available
+from kimi_cli.utils.clipboard import grab_image_from_clipboard, is_clipboard_available
 from kimi_cli.utils.logging import logger
+from kimi_cli.utils.media_tags import wrap_media_part
+from kimi_cli.utils.slashcmd import SlashCommand
 from kimi_cli.utils.string import random_string
+from kimi_cli.wire.types import ContentPart, ImageURLPart, TextPart
 
 PROMPT_SYMBOL = "✨"
 PROMPT_SYMBOL_SHELL = "$"
 PROMPT_SYMBOL_THINKING = "💫"
 
 
-class MetaCommandCompleter(Completer):
-    """A completer that:
-    - Shows one line per meta command in the form: "/name (alias1, alias2)"
-    - Matches by primary name or any alias while inserting the canonical "/name"
+class SlashCommandCompleter(Completer):
+    """
+    A completer that:
+    - Shows one line per slash command in the form: "/name (alias1, alias2)"
+    - Fuzzy-matches by primary name or any alias while inserting the canonical "/name"
     - Only activates when the current token starts with '/'
     """
 
+    def __init__(self, available_commands: Sequence[SlashCommand[Any]]) -> None:
+        super().__init__()
+        self._available_commands = list(available_commands)
+        self._command_lookup: dict[str, list[SlashCommand[Any]]] = {}
+        words: list[str] = []
+
+        for cmd in sorted(self._available_commands, key=lambda c: c.name):
+            if cmd.name not in self._command_lookup:
+                self._command_lookup[cmd.name] = []
+                words.append(cmd.name)
+            self._command_lookup[cmd.name].append(cmd)
+            for alias in cmd.aliases:
+                if alias in self._command_lookup:
+                    self._command_lookup[alias].append(cmd)
+                else:
+                    self._command_lookup[alias] = [cmd]
+                    words.append(alias)
+
+        self._word_pattern = re.compile(r"[^\s]+")
+        self._fuzzy_pattern = r"^[^\s]*"
+        self._word_completer = WordCompleter(words, WORD=False, pattern=self._word_pattern)
+        self._fuzzy = FuzzyCompleter(self._word_completer, WORD=False, pattern=self._fuzzy_pattern)
+
     @override
-    def get_completions(self, document, complete_event):
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
         text = document.text_before_cursor
 
         # Only autocomplete when the input buffer has no other content.
@@ -81,11 +109,21 @@ class MetaCommandCompleter(Completer):
             return
 
         typed = token[1:]
-        typed_lower = typed.lower()
+        if typed and typed in self._command_lookup:
+            return
+        mention_doc = Document(text=typed, cursor_position=len(typed))
+        candidates = list(self._fuzzy.get_completions(mention_doc, complete_event))
 
-        for cmd in sorted(get_meta_commands(), key=lambda c: c.name):
-            names = [cmd.name] + list(cmd.aliases)
-            if typed == "" or any(n.lower().startswith(typed_lower) for n in names):
+        seen: set[str] = set()
+
+        for candidate in candidates:
+            commands = self._command_lookup.get(candidate.text)
+            if not commands:
+                continue
+            for cmd in commands:
+                if cmd.name in seen:
+                    continue
+                seen.add(cmd.name)
                 yield Completion(
                     text=f"/{cmd.name}",
                     start_position=-len(token),
@@ -308,7 +346,9 @@ class LocalFileMentionCompleter(Completer):
             return False
 
     @override
-    def get_completions(self, document, complete_event):
+    def get_completions(
+        self, document: Document, complete_event: CompleteEvent
+    ) -> Iterable[Completion]:
         fragment = self._extract_fragment(document.text_before_cursor)
         if fragment is None:
             return
@@ -324,7 +364,7 @@ class LocalFileMentionCompleter(Completer):
             # re-rank: prefer basename matches
             frag_lower = fragment.lower()
 
-            def _rank(c: Completion) -> tuple:
+            def _rank(c: Completion) -> tuple[int, ...]:
                 path = c.text
                 base = path.rstrip("/").split("/")[-1].lower()
                 if base.startswith(frag_lower):
@@ -397,7 +437,6 @@ class PromptMode(Enum):
 
 class UserInput(BaseModel):
     mode: PromptMode
-    thinking: bool
     command: str
     """The plain text representation of the user input."""
     content: list[ContentPart]
@@ -421,7 +460,10 @@ class _ToastEntry:
     duration: float
 
 
-_toast_queue = deque[_ToastEntry]()
+_toast_queues: dict[Literal["left", "right"], deque[_ToastEntry]] = {
+    "left": deque(),
+    "right": deque(),
+}
 """The queue of toasts to show, including the one currently being shown (the first one)."""
 
 
@@ -430,38 +472,168 @@ def toast(
     duration: float = 5.0,
     topic: str | None = None,
     immediate: bool = False,
+    position: Literal["left", "right"] = "left",
 ) -> None:
+    queue = _toast_queues[position]
     duration = max(duration, _REFRESH_INTERVAL)
     entry = _ToastEntry(topic=topic, message=message, duration=duration)
     if topic is not None:
         # Remove existing toasts with the same topic
-        for existing in list(_toast_queue):
+        for existing in list(queue):
             if existing.topic == topic:
-                _toast_queue.remove(existing)
+                queue.remove(existing)
     if immediate:
-        _toast_queue.appendleft(entry)
+        queue.appendleft(entry)
     else:
-        _toast_queue.append(entry)
+        queue.append(entry)
 
 
-def _current_toast() -> _ToastEntry | None:
-    if not _toast_queue:
+def _current_toast(position: Literal["left", "right"] = "left") -> _ToastEntry | None:
+    queue = _toast_queues[position]
+    if not queue:
         return None
-    return _toast_queue[0]
-
-
-def _toast_thinking(thinking: bool) -> None:
-    toast(
-        f"thinking {'on' if thinking else 'off'}, tab to toggle",
-        duration=3.0,
-        topic="thinking",
-        immediate=True,
-    )
+    return queue[0]
 
 
 _ATTACHMENT_PLACEHOLDER_RE = re.compile(
-    r"\[(?P<type>image):(?P<id>[a-zA-Z0-9_\-\.]+)(?:,(?P<width>\d+)x(?P<height>\d+))?\]"
+    r"\[(?P<type>[a-zA-Z0-9_\-]+):(?P<id>[a-zA-Z0-9_\-\.]+)"
+    r"(?:,(?P<width>\d+)x(?P<height>\d+))?\]"
 )
+
+
+def _guess_image_mime(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(path.name)
+    if mime:
+        return mime
+    # fallback to PNG
+    return "image/png"
+
+
+def _build_image_part(image_bytes: bytes, mime_type: str) -> ImageURLPart:
+    image_base64 = base64.b64encode(image_bytes).decode("ascii")
+    return ImageURLPart(
+        image_url=ImageURLPart.ImageURL(
+            url=f"data:{mime_type};base64,{image_base64}",
+        )
+    )
+
+
+type CachedAttachmentKind = Literal["image"]
+
+
+@dataclass(slots=True)
+class CachedAttachment:
+    kind: CachedAttachmentKind
+    attachment_id: str
+    path: Path
+
+
+class AttachmentCache:
+    def __init__(self, root: Path | None = None) -> None:
+        self._root = root or Path("/tmp/kimi")
+        self._dir_map: dict[CachedAttachmentKind, str] = {"image": "images"}
+        self._payload_map: dict[tuple[CachedAttachmentKind, str, str], CachedAttachment] = {}
+
+    def _dir_for(self, kind: CachedAttachmentKind) -> Path:
+        return self._root / self._dir_map[kind]
+
+    def _ensure_dir(self, kind: CachedAttachmentKind) -> Path | None:
+        path = self._dir_for(kind)
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(
+                "Failed to create attachment cache dir: {dir} ({error})",
+                dir=path,
+                error=exc,
+            )
+            return None
+        return path
+
+    def _reserve_id(self, dir_path: Path, suffix: str) -> str:
+        for _ in range(5):
+            candidate = f"{random_string(8)}{suffix}"
+            if not (dir_path / candidate).exists():
+                return candidate
+        return f"{random_string(12)}{suffix}"
+
+    def store_bytes(
+        self, kind: CachedAttachmentKind, suffix: str, payload: bytes
+    ) -> CachedAttachment | None:
+        dir_path = self._ensure_dir(kind)
+        if dir_path is None:
+            return None
+        payload_hash = sha256(payload).hexdigest()
+        cache_key = (kind, suffix, payload_hash)
+        cached = self._payload_map.get(cache_key)
+        if cached is not None:
+            if cached.path.exists():
+                return cached
+            self._payload_map.pop(cache_key, None)
+
+        attachment_id = self._reserve_id(dir_path, suffix)
+        path = dir_path / attachment_id
+        try:
+            path.write_bytes(payload)
+        except OSError as exc:
+            logger.warning(
+                "Failed to write cached attachment: {file} ({error})",
+                file=path,
+                error=exc,
+            )
+            return None
+        cached = CachedAttachment(kind=kind, attachment_id=attachment_id, path=path)
+        self._payload_map[cache_key] = cached
+        return cached
+
+    def store_image(self, image: Image.Image) -> CachedAttachment | None:
+        png_bytes = BytesIO()
+        image.save(png_bytes, format="PNG")
+        return self.store_bytes("image", ".png", png_bytes.getvalue())
+
+    def load_bytes(
+        self, kind: CachedAttachmentKind, attachment_id: str
+    ) -> tuple[Path, bytes] | None:
+        path = self._dir_for(kind) / attachment_id
+        if not path.exists():
+            return None
+        try:
+            return path, path.read_bytes()
+        except OSError as exc:
+            logger.warning(
+                "Failed to read cached attachment: {file} ({error})",
+                file=path,
+                error=exc,
+            )
+            return None
+
+    def load_content_parts(
+        self, kind: CachedAttachmentKind, attachment_id: str
+    ) -> list[ContentPart] | None:
+        if kind == "image":
+            payload = self.load_bytes(kind, attachment_id)
+            if payload is None:
+                return None
+            path, image_bytes = payload
+            mime_type = _guess_image_mime(path)
+            part = _build_image_part(image_bytes, mime_type)
+            return wrap_media_part(part, tag="image", attrs={"path": str(path)})
+        return None
+
+
+def _parse_attachment_kind(raw_kind: str) -> CachedAttachmentKind | None:
+    if raw_kind == "image":
+        return "image"
+    return None
+
+
+def _sanitize_surrogates(text: str) -> str:
+    """Sanitize UTF-16 surrogate characters that cannot be encoded to UTF-8.
+
+    This is particularly common on Windows when copying text from applications
+    that use UTF-16 internally and don't properly convert surrogate pairs.
+    """
+    return text.encode("utf-8", errors="surrogatepass").decode("utf-8", errors="replace")
 
 
 class CustomPromptSession:
@@ -470,7 +642,10 @@ class CustomPromptSession:
         *,
         status_provider: Callable[[], StatusSnapshot],
         model_capabilities: set[ModelCapability],
-        initial_thinking: bool,
+        model_name: str | None,
+        thinking: bool,
+        agent_mode_slash_commands: Sequence[SlashCommand[Any]],
+        shell_mode_slash_commands: Sequence[SlashCommand[Any]],
     ) -> None:
         history_dir = get_share_dir() / "user-history"
         history_dir.mkdir(parents=True, exist_ok=True)
@@ -478,11 +653,11 @@ class CustomPromptSession:
         self._history_file = (history_dir / work_dir_id).with_suffix(".jsonl")
         self._status_provider = status_provider
         self._model_capabilities = model_capabilities
+        self._model_name = model_name
         self._last_history_content: str | None = None
         self._mode: PromptMode = PromptMode.AGENT
-        self._thinking = initial_thinking
-        self._attachment_parts: dict[str, ContentPart] = {}
-        """Mapping from attachment id to ContentPart."""
+        self._thinking = thinking
+        self._attachment_cache = AttachmentCache()
 
         history_entries = _load_history_entries(self._history_file)
         history = InMemoryHistory()
@@ -496,19 +671,19 @@ class CustomPromptSession:
         # Build completers
         self._agent_mode_completer = merge_completers(
             [
-                MetaCommandCompleter(),
+                SlashCommandCompleter(agent_mode_slash_commands),
                 # TODO(kaos): we need an async KaosFileMentionCompleter
                 LocalFileMentionCompleter(KaosPath.cwd().unsafe_to_local_path()),
             ],
             deduplicate=True,
         )
+        self._shell_mode_completer = SlashCommandCompleter(shell_mode_slash_commands)
 
         # Build key bindings
         _kb = KeyBindings()
-        shortcut_hints: list[str] = []
 
         @_kb.add("enter", filter=has_completions)
-        def _accept_completion(event: KeyPressEvent) -> None:
+        def _(event: KeyPressEvent) -> None:
             """Accept the first completion when Enter is pressed and completions are shown."""
             buff = event.current_buffer
             if buff.complete_state and buff.complete_state.completions:
@@ -519,75 +694,59 @@ class CustomPromptSession:
                 buff.apply_completion(completion)
 
         @_kb.add("c-x", eager=True)
-        def _switch_mode(event: KeyPressEvent) -> None:
+        def _(event: KeyPressEvent) -> None:
             self._mode = self._mode.toggle()
             # Apply mode-specific settings
             self._apply_mode(event)
             # Redraw UI
             event.app.invalidate()
 
-        shortcut_hints.append("ctrl-x: switch mode")
-
         @_kb.add("escape", "enter", eager=True)
         @_kb.add("c-j", eager=True)
-        def _insert_newline(event: KeyPressEvent) -> None:
+        def _(event: KeyPressEvent) -> None:
             """Insert a newline when Alt-Enter or Ctrl-J is pressed."""
             event.current_buffer.insert_text("\n")
-
-        shortcut_hints.append("ctrl-j: newline")
 
         if is_clipboard_available():
 
             @_kb.add("c-v", eager=True)
-            def _paste(event: KeyPressEvent) -> None:
+            def _(event: KeyPressEvent) -> None:
                 if self._try_paste_image(event):
                     return
                 clipboard_data = event.app.clipboard.get_data()
                 event.current_buffer.paste_clipboard_data(clipboard_data)
 
-            shortcut_hints.append("ctrl-v: paste")
             clipboard = PyperclipClipboard()
         else:
             clipboard = None
 
-        @Condition
-        def is_agent_mode() -> bool:
-            return self._mode == PromptMode.AGENT
+        @_kb.add("c-_", eager=True)  # Ctrl-/ sends Ctrl-_ in most terminals
+        def _(event: KeyPressEvent) -> None:
+            """Show help by submitting /help command."""
+            buff = event.current_buffer
+            buff.text = "/help"
+            buff.validate_and_handle()
 
-        _toast_thinking(self._thinking)
-
-        @_kb.add("tab", filter=~has_completions & is_agent_mode, eager=True)
-        def _switch_thinking(event: KeyPressEvent) -> None:
-            """Toggle thinking mode when Tab is pressed and no completions are shown."""
-            if "thinking" not in self._model_capabilities:
-                console.print(
-                    "[yellow]Thinking mode is not supported by the selected LLM model[/yellow]"
-                )
-                return
-            self._thinking = not self._thinking
-            _toast_thinking(self._thinking)
-            event.app.invalidate()
-
-        self._shortcut_hints = shortcut_hints
-        self._session = PromptSession(
+        self._session = PromptSession[str](
             message=self._render_message,
             # prompt_continuation=FormattedText([("fg:#4d4d4d", "... ")]),
             completer=self._agent_mode_completer,
-            complete_while_typing=Condition(lambda: self._mode == PromptMode.AGENT),
+            complete_while_typing=True,
             key_bindings=_kb,
             clipboard=clipboard,
             history=history,
             bottom_toolbar=self._render_bottom_toolbar,
+            style=Style.from_dict({"bottom-toolbar": "noreverse"}),
         )
 
         # Allow completion to be triggered when the text is changed,
         # such as when backspace is used to delete text.
         @self._session.default_buffer.on_text_changed.add_handler
-        def trigger_complete(buffer: Buffer) -> None:
+        def _(buffer: Buffer) -> None:
             if buffer.complete_while_typing():
                 buffer.start_completion()
 
-        self._status_refresh_task: asyncio.Task | None = None
+        self._status_refresh_task: asyncio.Task[None] | None = None
 
     def _render_message(self) -> FormattedText:
         symbol = PROMPT_SYMBOL if self._mode == PromptMode.AGENT else PROMPT_SYMBOL_SHELL
@@ -603,12 +762,8 @@ class CustomPromptSession:
             buff = None
 
         if self._mode == PromptMode.SHELL:
-            # Cancel any active completion menu
-            with contextlib.suppress(Exception):
-                if buff is not None:
-                    buff.cancel_completion()
             if buff is not None:
-                buff.completer = DummyCompleter()
+                buff.completer = self._shell_mode_completer
         else:
             if buff is not None:
                 buff.completer = self._agent_mode_completer
@@ -639,27 +794,14 @@ class CustomPromptSession:
         self._status_refresh_task = asyncio.create_task(_refresh(_REFRESH_INTERVAL))
         return self
 
-    def __exit__(self, exc_type, exc_value, traceback) -> None:
+    def __exit__(self, *_) -> None:
         if self._status_refresh_task is not None and not self._status_refresh_task.done():
             self._status_refresh_task.cancel()
         self._status_refresh_task = None
-        self._attachment_parts.clear()
 
     def _try_paste_image(self, event: KeyPressEvent) -> bool:
         """Try to paste an image from the clipboard. Return True if successful."""
-        # Try get image from clipboard
-        image = ImageGrab.grabclipboard()
-        if isinstance(image, list):
-            for item in image:
-                try:
-                    with Image.open(item) as img:
-                        image = img.copy()
-                    break
-                except Exception:
-                    continue
-            else:
-                image = None
-
+        image = grab_image_from_clipboard()
         if image is None:
             return False
 
@@ -667,23 +809,16 @@ class CustomPromptSession:
             console.print("[yellow]Image input is not supported by the selected LLM model[/yellow]")
             return False
 
-        attachment_id = f"{random_string(8)}.png"
-        png_bytes = BytesIO()
-        image.save(png_bytes, format="PNG")
-        png_base64 = base64.b64encode(png_bytes.getvalue()).decode("ascii")
-        image_part = ImageURLPart(
-            image_url=ImageURLPart.ImageURL(
-                url=f"data:image/png;base64,{png_base64}", id=attachment_id
-            )
-        )
-        self._attachment_parts[attachment_id] = image_part
+        cached = self._attachment_cache.store_image(image)
+        if cached is None:
+            return False
         logger.debug(
             "Pasted image from clipboard: {attachment_id}, {image_size}",
-            attachment_id=attachment_id,
+            attachment_id=cached.attachment_id,
             image_size=image.size,
         )
 
-        placeholder = f"[image:{attachment_id},{image.width}x{image.height}]"
+        placeholder = f"[image:{cached.attachment_id},{image.width}x{image.height}]"
         event.current_buffer.insert_text(placeholder)
         event.app.invalidate()
         return True
@@ -692,6 +827,8 @@ class CustomPromptSession:
         with patch_stdout(raw=True):
             command = str(await self._session.prompt_async()).strip()
             command = command.replace("\x00", "")  # just in case null bytes are somehow inserted
+            # Sanitize UTF-16 surrogates that may come from Windows clipboard
+            command = _sanitize_surrogates(command)
         self._append_history_entry(command)
 
         # Parse rich content parts
@@ -702,9 +839,12 @@ class CustomPromptSession:
             if start > 0:
                 content.append(TextPart(text=remaining_command[:start]))
             attachment_id = match.group("id")
-            part = self._attachment_parts.get(attachment_id)
+            attachment_kind = _parse_attachment_kind(match.group("type"))
+            part = None
+            if attachment_kind is not None:
+                part = self._attachment_cache.load_content_parts(attachment_kind, attachment_id)
             if part is not None:
-                content.append(part)
+                content.extend(part)
             else:
                 logger.warning(
                     "Attachment placeholder found but no matching attachment part: {placeholder}",
@@ -713,12 +853,11 @@ class CustomPromptSession:
                 content.append(TextPart(text=match.group(0)))
             remaining_command = remaining_command[end:]
 
-        if remaining_command.strip():
-            content.append(TextPart(text=remaining_command.strip()))
+        if remaining_command:
+            content.append(TextPart(text=remaining_command))
 
         return UserInput(
             mode=self._mode,
-            thinking=self._thinking,
             content=content,
             command=command,
         )
@@ -756,40 +895,49 @@ class CustomPromptSession:
         columns -= len(now_text) + 2
 
         mode = str(self._mode).lower()
-        if self._mode == PromptMode.AGENT and self._thinking:
-            mode += " (thinking)"
+        if self._mode == PromptMode.AGENT:
+            mode_details: list[str] = []
+            if self._model_name:
+                mode_details.append(self._model_name)
+            if self._thinking:
+                mode_details.append("thinking")
+            if mode_details:
+                mode += f" ({', '.join(mode_details)})"
+        status = self._status_provider()
+        if status.yolo_enabled:
+            fragments.extend([("bold fg:#ffff00", "yolo"), ("", " " * 2)])
+            columns -= len("yolo") + 2
         fragments.extend([("", f"{mode}"), ("", " " * 2)])
         columns -= len(mode) + 2
+        right_text = self._render_right_span(status)
 
-        status = self._status_provider()
-        status_text = self._format_status(status)
-
-        current_toast = _current_toast()
-        if current_toast is not None:
-            fragments.extend([("", current_toast.message), ("", " " * 2)])
-            columns -= len(current_toast.message) + 2
-            current_toast.duration -= _REFRESH_INTERVAL
-            if current_toast.duration <= 0.0:
-                _toast_queue.popleft()
+        current_toast_left = _current_toast("left")
+        if current_toast_left is not None:
+            fragments.extend([("", current_toast_left.message), ("", " " * 2)])
+            columns -= len(current_toast_left.message) + 2
+            current_toast_left.duration -= _REFRESH_INTERVAL
+            if current_toast_left.duration <= 0.0:
+                _toast_queues["left"].popleft()
         else:
-            shortcuts = [
-                *self._shortcut_hints,
-                "ctrl-d: exit",
-            ]
-            for shortcut in shortcuts:
-                if columns - len(status_text) > len(shortcut) + 2:
-                    fragments.extend([("", shortcut), ("", " " * 2)])
-                    columns -= len(shortcut) + 2
-                else:
-                    break
+            shortcuts = "ctrl-x: toggle mode  ctrl-/: help"
+            if columns - len(right_text) > len(shortcuts) + 2:
+                fragments.extend([("", shortcuts), ("", " " * 2)])
+                columns -= len(shortcuts) + 2
 
-        padding = max(1, columns - len(status_text))
+        padding = max(1, columns - len(right_text))
         fragments.append(("", " " * padding))
-        fragments.append(("", status_text))
+        fragments.append(("", right_text))
 
         return FormattedText(fragments)
 
     @staticmethod
-    def _format_status(status: StatusSnapshot) -> str:
-        bounded = max(0.0, min(status.context_usage, 1.0))
-        return f"context: {bounded:.1%}"
+    def _render_right_span(status: StatusSnapshot) -> str:
+        current_toast = _current_toast("right")
+        if current_toast is None:
+            bounded = max(0.0, min(status.context_usage, 1.0))
+            return f"context: {bounded:.1%}"
+
+        current_toast.duration -= _REFRESH_INTERVAL
+        if current_toast.duration <= 0.0:
+            _toast_queues["right"].popleft()
+        return current_toast.message

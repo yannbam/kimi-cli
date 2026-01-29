@@ -11,8 +11,13 @@ datas = (
             "agents/**/*.md",
             "deps/bin/**",
             "prompts/**/*.md",
+            "skills/**",
             "tools/**/*.md",
+            "web/static/**",
             "CHANGELOG.md",
+        ],
+        excludes=[
+            "tools/*.md",
         ],
     )
     + collect_data_files(

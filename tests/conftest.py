@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import platform
 import tempfile
 from collections.abc import Generator
@@ -9,15 +10,17 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from kaos import get_current_kaos, reset_current_kaos, set_current_kaos
+from kaos.local import LocalKaos
+from kaos.path import KaosPath
 from kosong.chat_provider.mock import MockChatProvider
 from kosong.tooling.empty import EmptyToolset
 from pydantic import SecretStr
 
-from kaos import current_kaos
-from kaos.local import LocalKaos
-from kaos.path import KaosPath
+from kimi_cli.auth.oauth import OAuthManager
 from kimi_cli.config import Config, MoonshotSearchConfig, get_default_config
-from kimi_cli.llm import LLM
+from kimi_cli.llm import ALL_MODEL_CAPABILITIES, LLM
+from kimi_cli.metadata import WorkDirMeta
 from kimi_cli.session import Session
 from kimi_cli.soul.agent import Agent, BuiltinSystemPromptArgs, LaborMarket, Runtime
 from kimi_cli.soul.approval import Approval
@@ -27,6 +30,7 @@ from kimi_cli.tools.dmail import SendDMail
 from kimi_cli.tools.file.glob import Glob
 from kimi_cli.tools.file.grep_local import Grep
 from kimi_cli.tools.file.read import ReadFile
+from kimi_cli.tools.file.read_media import ReadMediaFile
 from kimi_cli.tools.file.replace import StrReplaceFile
 from kimi_cli.tools.file.write import WriteFile
 from kimi_cli.tools.multiagent.create import CreateSubagent
@@ -36,6 +40,8 @@ from kimi_cli.tools.think import Think
 from kimi_cli.tools.todo import SetTodoList
 from kimi_cli.tools.web.fetch import FetchURL
 from kimi_cli.tools.web.search import SearchWeb
+from kimi_cli.utils.environment import Environment
+from kimi_cli.wire.file import WireFile
 
 
 @pytest.fixture
@@ -55,19 +61,23 @@ def llm() -> LLM:
     return LLM(
         chat_provider=MockChatProvider([]),
         max_context_size=100_000,
-        capabilities=set(),
+        capabilities=ALL_MODEL_CAPABILITIES,
     )
 
 
 @pytest.fixture
 def temp_work_dir() -> Generator[KaosPath]:
     """Create a temporary working directory for tests."""
-    token = current_kaos.set(LocalKaos())
-    try:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            yield KaosPath.unsafe_from_local_path(Path(tmpdir))
-    finally:
-        current_kaos.reset(token)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        original_cwd = Path.cwd()
+        p = Path(tmpdir).resolve()
+        os.chdir(p)
+        token = set_current_kaos(LocalKaos())
+        try:
+            yield KaosPath.unsafe_from_local_path(p)
+        finally:
+            reset_current_kaos(token)
+            os.chdir(original_cwd)
 
 
 @pytest.fixture
@@ -85,6 +95,7 @@ def builtin_args(temp_work_dir: KaosPath) -> BuiltinSystemPromptArgs:
         KIMI_WORK_DIR=temp_work_dir,
         KIMI_WORK_DIR_LS="Test ls content",
         KIMI_AGENTS_MD="Test agents content",
+        KIMI_SKILLS="No skills found.",
     )
 
 
@@ -100,7 +111,11 @@ def session(temp_work_dir: KaosPath, temp_share_dir: Path) -> Session:
     return Session(
         id="test",
         work_dir=temp_work_dir,
-        history_file=temp_share_dir / "history.jsonl",
+        work_dir_meta=WorkDirMeta(path=str(temp_work_dir), kaos=get_current_kaos().name),
+        context_file=temp_share_dir / "context.jsonl",
+        wire_file=WireFile(path=temp_share_dir / "wire.jsonl"),
+        title="Test Session",
+        updated_at=0.0,
     )
 
 
@@ -117,6 +132,27 @@ def labor_market() -> LaborMarket:
 
 
 @pytest.fixture
+def environment() -> Environment:
+    """Create an Environment instance."""
+    if platform.system() == "Windows":
+        return Environment(
+            os_kind="Windows",
+            os_arch="x86_64",
+            os_version="1.0",
+            shell_name="Windows PowerShell",
+            shell_path=KaosPath("powershell.exe"),
+        )
+    else:
+        return Environment(
+            os_kind="Unix",
+            os_arch="aarch64",
+            os_version="1.0",
+            shell_name="bash",
+            shell_path=KaosPath("/bin/bash"),
+        )
+
+
+@pytest.fixture
 def runtime(
     config: Config,
     llm: LLM,
@@ -125,6 +161,7 @@ def runtime(
     session: Session,
     approval: Approval,
     labor_market: LaborMarket,
+    environment: Environment,
 ) -> Runtime:
     """Create a Runtime instance."""
     rt = Runtime(
@@ -135,6 +172,9 @@ def runtime(
         session=session,
         approval=approval,
         labor_market=labor_market,
+        environment=environment,
+        skills={},
+        oauth=OAuthManager(config),
     )
     rt.labor_market.add_fixed_subagent(
         "mocker",
@@ -157,9 +197,8 @@ def toolset() -> KimiToolset:
 @contextmanager
 def tool_call_context(tool_name: str) -> Generator[None]:
     """Create a tool call context."""
-    from kosong.message import ToolCall
-
     from kimi_cli.soul.toolset import current_tool_call
+    from kimi_cli.wire.types import ToolCall
 
     token = current_tool_call.set(
         ToolCall(id="test", function=ToolCall.FunctionBody(name=tool_name, arguments=None))
@@ -201,16 +240,22 @@ def set_todo_list_tool() -> SetTodoList:
 
 
 @pytest.fixture
-def shell_tool(approval: Approval) -> Generator[Shell]:
+def shell_tool(approval: Approval, environment: Environment) -> Generator[Shell]:
     """Create a Shell tool instance."""
     with tool_call_context("Shell"):
-        yield Shell(approval)
+        yield Shell(approval, environment)
 
 
 @pytest.fixture
-def read_file_tool(builtin_args: BuiltinSystemPromptArgs) -> ReadFile:
+def read_file_tool(runtime: Runtime) -> ReadFile:
     """Create a ReadFile tool instance."""
-    return ReadFile(builtin_args)
+    return ReadFile(runtime)
+
+
+@pytest.fixture
+def read_media_file_tool(runtime: Runtime) -> ReadMediaFile:
+    """Create a ReadMediaFile tool instance."""
+    return ReadMediaFile(runtime)
 
 
 @pytest.fixture
@@ -244,24 +289,22 @@ def str_replace_file_tool(
 
 
 @pytest.fixture
-def search_web_tool(config: Config) -> SearchWeb:
+def search_web_tool(config: Config, runtime: Runtime) -> SearchWeb:
     """Create a SearchWeb tool instance."""
-    return SearchWeb(config)
+    return SearchWeb(config, runtime)
 
 
 @pytest.fixture
-def fetch_url_tool(config: Config) -> FetchURL:
+def fetch_url_tool(config: Config, runtime: Runtime) -> FetchURL:
     """Create a FetchURL tool instance."""
-    return FetchURL(config)
+    return FetchURL(config, runtime)
 
 
 # misc fixtures
 
 
 @pytest.fixture
-def outside_file() -> Path:
+def outside_file() -> Generator[Path]:
     """Return a path to a file outside the working directory."""
-    if platform.system() == "Windows":
-        return Path("C:/outside_file.txt")
-    else:
-        return Path("/outside_file.txt")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        yield Path(tmpdir) / "outside_file.txt"

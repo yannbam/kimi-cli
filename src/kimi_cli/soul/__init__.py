@@ -7,19 +7,22 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
-from kosong.message import ContentPart
-
+from kimi_cli.utils.aioqueue import QueueShutDown
 from kimi_cli.utils.logging import logger
-from kimi_cli.wire import Wire, WireMessage, WireUISide
+from kimi_cli.wire import Wire
+from kimi_cli.wire.file import WireFile
+from kimi_cli.wire.types import ContentPart, WireMessage
 
 if TYPE_CHECKING:
     from kimi_cli.llm import LLM, ModelCapability
+    from kimi_cli.utils.slashcmd import SlashCommand
 
 
 class LLMNotSet(Exception):
     """Raised when the LLM is not set."""
 
-    pass
+    def __init__(self) -> None:
+        super().__init__("LLM not set")
 
 
 class LLMNotSupported(Exception):
@@ -42,6 +45,7 @@ class MaxStepsReached(Exception):
     """The number of steps that have been taken."""
 
     def __init__(self, n_steps: int):
+        super().__init__(f"Max number of steps reached: {n_steps}")
         self.n_steps = n_steps
 
 
@@ -49,6 +53,8 @@ class MaxStepsReached(Exception):
 class StatusSnapshot:
     context_usage: float
     """The usage of the context, in percentage."""
+    yolo_enabled: bool = False
+    """Whether YOLO (auto-approve) mode is enabled."""
 
 
 @runtime_checkable
@@ -60,17 +66,30 @@ class Soul(Protocol):
 
     @property
     def model_name(self) -> str:
-        """The name of the LLM model used by the soul. Empty string indicates no LLM configured."""
+        """The name of the LLM model used by the soul. Empty string if LLM is not set."""
         ...
 
     @property
     def model_capabilities(self) -> set[ModelCapability] | None:
-        """The capabilities of the LLM model used by the soul. None indicates no LLM configured."""
+        """The capabilities of the LLM model used by the soul. None if LLM is not set."""
+        ...
+
+    @property
+    def thinking(self) -> bool | None:
+        """
+        Whether thinking mode is currently enabled.
+        None if LLM is not set or thinking mode is not set explicitly.
+        """
         ...
 
     @property
     def status(self) -> StatusSnapshot:
         """The current status of the soul. The returned value is immutable."""
+        ...
+
+    @property
+    def available_slash_commands(self) -> list[SlashCommand[Any]]:
+        """List of available slash commands supported by the soul."""
         ...
 
     async def run(self, user_input: str | list[ContentPart]):
@@ -79,6 +98,7 @@ class Soul(Protocol):
 
         Args:
             user_input (str | list[ContentPart]): The user input to the agent.
+                Can be a slash command call or natural language input.
 
         Raises:
             LLMNotSet: When the LLM is not set.
@@ -90,7 +110,7 @@ class Soul(Protocol):
         ...
 
 
-type UILoopFn = Callable[[WireUISide], Coroutine[Any, Any, None]]
+type UILoopFn = Callable[[Wire], Coroutine[Any, Any, None]]
 """A long-running async function to visualize the agent behavior."""
 
 
@@ -103,9 +123,10 @@ async def run_soul(
     user_input: str | list[ContentPart],
     ui_loop_fn: UILoopFn,
     cancel_event: asyncio.Event,
+    wire_file: WireFile | None = None,
 ) -> None:
     """
-    Run the soul with the given user input, connecting it to the UI loop with a wire.
+    Run the soul with the given user input, connecting it to the UI loop with a `Wire`.
 
     `cancel_event` is a outside handle that can be used to cancel the run. When the
     event is set, the run will be gracefully stopped and a `RunCancelled` will be raised.
@@ -117,11 +138,11 @@ async def run_soul(
         MaxStepsReached: When the maximum number of steps is reached.
         RunCancelled: When the run is cancelled by the cancel event.
     """
-    wire = Wire()
+    wire = Wire(file_backend=wire_file)
     wire_token = _current_wire.set(wire)
 
     logger.debug("Starting UI loop with function: {ui_loop_fn}", ui_loop_fn=ui_loop_fn)
-    ui_task = asyncio.create_task(ui_loop_fn(wire.ui_side))
+    ui_task = asyncio.create_task(ui_loop_fn(wire))
 
     logger.debug("Starting soul run")
     soul_task = asyncio.create_task(soul.run(user_input))
@@ -150,9 +171,10 @@ async def run_soul(
         logger.debug("Shutting down the UI loop")
         # shutting down the wire should break the UI loop
         wire.shutdown()
+        await wire.join()
         try:
             await asyncio.wait_for(ui_task, timeout=0.5)
-        except asyncio.QueueShutDown:
+        except QueueShutDown:
             logger.debug("UI loop shut down")
             pass
         except TimeoutError:

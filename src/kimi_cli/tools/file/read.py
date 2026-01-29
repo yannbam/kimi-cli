@@ -1,12 +1,14 @@
 from pathlib import Path
-from typing import Any, override
-
-from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnType
-from pydantic import BaseModel, Field
+from typing import override
 
 from kaos.path import KaosPath
-from kimi_cli.soul.agent import BuiltinSystemPromptArgs
-from kimi_cli.tools.utils import load_desc, truncate_line
+from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnValue
+from pydantic import BaseModel, Field
+
+from kimi_cli.soul.agent import Runtime
+from kimi_cli.tools.file.utils import MEDIA_SNIFF_BYTES, detect_file_type
+from kimi_cli.tools.utils import load_desc_jinja, truncate_line
+from kimi_cli.utils.path import is_within_directory
 
 MAX_LINES = 1000
 MAX_LINE_LENGTH = 2000
@@ -14,7 +16,12 @@ MAX_BYTES = 100 << 10  # 100KB
 
 
 class Params(BaseModel):
-    path: str = Field(description="The absolute path to the file to read")
+    path: str = Field(
+        description=(
+            "The path to the file to read. Absolute paths are required when reading files "
+            "outside the working directory."
+        )
+    )
     line_offset: int = Field(
         description=(
             "The line number to start reading from. "
@@ -37,37 +44,53 @@ class Params(BaseModel):
 
 class ReadFile(CallableTool2[Params]):
     name: str = "ReadFile"
-    description: str = load_desc(
-        Path(__file__).parent / "read.md",
-        {
-            "MAX_LINES": str(MAX_LINES),
-            "MAX_LINE_LENGTH": str(MAX_LINE_LENGTH),
-            "MAX_BYTES": str(MAX_BYTES),
-        },
-    )
     params: type[Params] = Params
 
-    def __init__(self, builtin_args: BuiltinSystemPromptArgs, **kwargs: Any) -> None:
-        super().__init__(**kwargs)
+    def __init__(self, runtime: Runtime) -> None:
+        description = load_desc_jinja(
+            Path(__file__).parent / "read.md",
+            {
+                "MAX_LINES": MAX_LINES,
+                "MAX_LINE_LENGTH": MAX_LINE_LENGTH,
+                "MAX_BYTES": MAX_BYTES,
+            },
+        )
+        super().__init__(description=description)
+        self._runtime = runtime
+        self._work_dir = runtime.builtin_args.KIMI_WORK_DIR
 
-        self._work_dir = builtin_args.KIMI_WORK_DIR
+    async def _validate_path(self, path: KaosPath) -> ToolError | None:
+        """Validate that the path is safe to read."""
+        resolved_path = path.canonical()
+
+        if not is_within_directory(resolved_path, self._work_dir) and not path.is_absolute():
+            # Outside files can only be read with absolute paths
+            return ToolError(
+                message=(
+                    f"`{path}` is not an absolute path. "
+                    "You must provide an absolute path to read a file "
+                    "outside the working directory."
+                ),
+                brief="Invalid path",
+            )
+        return None
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
         # TODO: checks:
         # - check if the path may contain secrets
-        # - check if the file format is readable
-        try:
-            p = KaosPath(params.path)
 
-            if not p.is_absolute():
-                return ToolError(
-                    message=(
-                        f"`{params.path}` is not an absolute path. "
-                        "You must provide an absolute path to read a file."
-                    ),
-                    brief="Invalid path",
-                )
+        if not params.path:
+            return ToolError(
+                message="File path cannot be empty.",
+                brief="Empty file path",
+            )
+
+        try:
+            p = KaosPath(params.path).expanduser()
+            if err := await self._validate_path(p):
+                return err
+            p = p.canonical()
 
             if not await p.exists():
                 return ToolError(
@@ -80,6 +103,29 @@ class ReadFile(CallableTool2[Params]):
                     brief="Invalid path",
                 )
 
+            header = await p.read_bytes(MEDIA_SNIFF_BYTES)
+            file_type = detect_file_type(str(p), header=header)
+            if file_type.kind in ("image", "video"):
+                return ToolError(
+                    message=(
+                        f"`{params.path}` is a {file_type.kind} file. "
+                        "Use other appropriate tools to read image or video files."
+                    ),
+                    brief="Unsupported file type",
+                )
+
+            if file_type.kind == "unknown":
+                return ToolError(
+                    message=(
+                        f"`{params.path}` seems not readable. "
+                        "You may need to read it with proper shell commands, Python tools "
+                        "or MCP tools if available. "
+                        "If you read/operate it with Python, you MUST ensure that any "
+                        "third-party packages are installed in a virtual environment (venv)."
+                    ),
+                    brief="File not readable",
+                )
+
             assert params.line_offset >= 1
             assert params.n_lines >= 1
 
@@ -89,7 +135,7 @@ class ReadFile(CallableTool2[Params]):
             max_lines_reached = False
             max_bytes_reached = False
             current_line_no = 0
-            async for line in await p.read_lines(errors="replace"):
+            async for line in p.read_lines(errors="replace"):
                 current_line_no += 1
                 if current_line_no < params.line_offset:
                     continue

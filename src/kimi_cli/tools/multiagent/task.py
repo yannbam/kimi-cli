@@ -1,8 +1,8 @@
 import asyncio
 from pathlib import Path
-from typing import Any, override
+from typing import override
 
-from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnType
+from kosong.tooling import CallableTool2, ToolError, ToolOk, ToolReturnValue
 from pydantic import BaseModel, Field
 
 from kimi_cli.soul import MaxStepsReached, get_wire_or_none, run_soul
@@ -11,10 +11,15 @@ from kimi_cli.soul.context import Context
 from kimi_cli.soul.kimisoul import KimiSoul
 from kimi_cli.soul.toolset import get_current_tool_call_or_none
 from kimi_cli.tools.utils import load_desc
-from kimi_cli.utils.message import message_extract_text
 from kimi_cli.utils.path import next_available_rotation
-from kimi_cli.wire import WireMessage, WireUISide
-from kimi_cli.wire.message import ApprovalRequest, SubagentEvent
+from kimi_cli.wire import Wire
+from kimi_cli.wire.types import (
+    ApprovalRequest,
+    ApprovalResponse,
+    SubagentEvent,
+    ToolCallRequest,
+    WireMessage,
+)
 
 # Maximum continuation attempts for task summary
 MAX_CONTINUE_ATTEMPTS = 1
@@ -48,7 +53,7 @@ class Task(CallableTool2[Params]):
     name: str = "Task"
     params: type[Params] = Params
 
-    def __init__(self, runtime: Runtime, **kwargs: Any):
+    def __init__(self, runtime: Runtime):
         super().__init__(
             description=load_desc(
                 Path(__file__).parent / "task.md",
@@ -59,24 +64,23 @@ class Task(CallableTool2[Params]):
                     ),
                 },
             ),
-            **kwargs,
         )
         self._labor_market = runtime.labor_market
         self._session = runtime.session
 
-    async def _get_subagent_history_file(self) -> Path:
-        """Generate a unique history file path for subagent."""
-        main_history_file = self._session.history_file
-        subagent_base_name = f"{main_history_file.stem}_sub"
-        main_history_file.parent.mkdir(parents=True, exist_ok=True)  # just in case
-        sub_history_file = await next_available_rotation(
-            main_history_file.parent / f"{subagent_base_name}{main_history_file.suffix}"
+    async def _get_subagent_context_file(self) -> Path:
+        """Generate a unique context file path for subagent."""
+        main_context_file = self._session.context_file
+        subagent_base_name = f"{main_context_file.stem}_sub"
+        main_context_file.parent.mkdir(parents=True, exist_ok=True)  # just in case
+        sub_context_file = await next_available_rotation(
+            main_context_file.parent / f"{subagent_base_name}{main_context_file.suffix}"
         )
-        assert sub_history_file is not None
-        return sub_history_file
+        assert sub_context_file is not None
+        return sub_context_file
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
         subagents = self._labor_market.subagents
 
         if params.subagent_name not in subagents:
@@ -94,7 +98,7 @@ class Task(CallableTool2[Params]):
                 brief="Failed to run subagent",
             )
 
-    async def _run_subagent(self, agent: Agent, prompt: str) -> ToolReturnType:
+    async def _run_subagent(self, agent: Agent, prompt: str) -> ToolReturnValue:
         """Run subagent with optional continuation for task summary."""
         super_wire = get_wire_or_none()
         assert super_wire is not None
@@ -103,7 +107,8 @@ class Task(CallableTool2[Params]):
         current_tool_call_id = current_tool_call.id
 
         def _super_wire_send(msg: WireMessage) -> None:
-            if isinstance(msg, ApprovalRequest):
+            if isinstance(msg, ApprovalRequest | ApprovalResponse | ToolCallRequest):
+                # Requests should stay at the root wire level.
                 super_wire.soul_side.send(msg)
                 return
 
@@ -113,13 +118,14 @@ class Task(CallableTool2[Params]):
             )
             super_wire.soul_side.send(event)
 
-        async def _ui_loop_fn(wire: WireUISide) -> None:
+        async def _ui_loop_fn(wire: Wire) -> None:
+            wire_ui = wire.ui_side(merge=True)
             while True:
-                msg = await wire.receive()
+                msg = await wire_ui.receive()
                 _super_wire_send(msg)
 
-        subagent_history_file = await self._get_subagent_history_file()
-        context = Context(file_backend=subagent_history_file)
+        subagent_context_file = await self._get_subagent_context_file()
+        context = Context(file_backend=subagent_context_file)
         soul = KimiSoul(agent, context=context)
 
         try:
@@ -141,7 +147,7 @@ class Task(CallableTool2[Params]):
         if len(context.history) == 0 or context.history[-1].role != "assistant":
             return ToolError(message=_error_msg, brief="Failed to run subagent")
 
-        final_response = message_extract_text(context.history[-1])
+        final_response = context.history[-1].extract_text(sep="\n")
 
         # Check if response is too brief, if so, run again with continuation prompt
         n_attempts_remaining = MAX_CONTINUE_ATTEMPTS
@@ -150,6 +156,6 @@ class Task(CallableTool2[Params]):
 
             if len(context.history) == 0 or context.history[-1].role != "assistant":
                 return ToolError(message=_error_msg, brief="Failed to run subagent")
-            final_response = message_extract_text(context.history[-1])
+            final_response = context.history[-1].extract_text(sep="\n")
 
         return ToolOk(output=final_response)

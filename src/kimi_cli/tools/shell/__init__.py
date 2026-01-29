@@ -1,14 +1,17 @@
 import asyncio
-import platform
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, override
+from typing import override
 
-from kosong.tooling import CallableTool2, ToolReturnType
+import kaos
+from kaos import AsyncReadable
+from kosong.tooling import CallableTool2, ToolReturnValue
 from pydantic import BaseModel, Field
 
 from kimi_cli.soul.approval import Approval
+from kimi_cli.tools.display import ShellDisplayBlock
 from kimi_cli.tools.utils import ToolRejectedError, ToolResultBuilder, load_desc
+from kimi_cli.utils.environment import Environment
 
 MAX_TIMEOUT = 5 * 60
 
@@ -26,26 +29,39 @@ class Params(BaseModel):
     )
 
 
-_DESC_FILE = "cmd.md" if platform.system() == "Windows" else "bash.md"
-
-
 class Shell(CallableTool2[Params]):
     name: str = "Shell"
-    description: str = load_desc(Path(__file__).parent / _DESC_FILE, {})
     params: type[Params] = Params
 
-    def __init__(self, approval: Approval, **kwargs: Any):
-        super().__init__(**kwargs)
+    def __init__(self, approval: Approval, environment: Environment):
+        is_powershell = environment.shell_name == "Windows PowerShell"
+        super().__init__(
+            description=load_desc(
+                Path(__file__).parent / ("powershell.md" if is_powershell else "bash.md"),
+                {"SHELL": f"{environment.shell_name} (`{environment.shell_path}`)"},
+            )
+        )
         self._approval = approval
+        self._is_powershell = is_powershell
+        self._shell_path = environment.shell_path
 
     @override
-    async def __call__(self, params: Params) -> ToolReturnType:
+    async def __call__(self, params: Params) -> ToolReturnValue:
         builder = ToolResultBuilder()
+
+        if not params.command:
+            return builder.error("Command cannot be empty.", brief="Empty command")
 
         if not await self._approval.request(
             self.name,
-            "run shell command",
+            "run command",
             f"Run command `{params.command}`",
+            display=[
+                ShellDisplayBlock(
+                    language="powershell" if self._is_powershell else "bash",
+                    command=params.command,
+                )
+            ],
         ):
             return ToolRejectedError()
 
@@ -58,7 +74,7 @@ class Shell(CallableTool2[Params]):
             builder.write(line_str)
 
         try:
-            exitcode = await _stream_subprocess(
+            exitcode = await self._run_shell_command(
                 params.command, stdout_cb, stderr_cb, params.timeout
             )
 
@@ -75,38 +91,37 @@ class Shell(CallableTool2[Params]):
                 brief=f"Killed by timeout ({params.timeout}s)",
             )
 
+    async def _run_shell_command(
+        self,
+        command: str,
+        stdout_cb: Callable[[bytes], None],
+        stderr_cb: Callable[[bytes], None],
+        timeout: int,
+    ) -> int:
+        async def _read_stream(stream: AsyncReadable, cb: Callable[[bytes], None]):
+            while True:
+                line = await stream.readline()
+                if line:
+                    cb(line)
+                else:
+                    break
 
-async def _stream_subprocess(
-    command: str,
-    stdout_cb: Callable[[bytes], None],
-    stderr_cb: Callable[[bytes], None],
-    timeout: int,
-) -> int:
-    async def _read_stream(stream: asyncio.StreamReader, cb: Callable[[bytes], None]):
-        while True:
-            line = await stream.readline()
-            if line:
-                cb(line)
-            else:
-                break
+        process = await kaos.exec(*self._shell_args(command))
 
-    # FIXME: if the event loop is cancelled, an exception may be raised when the process finishes
-    process = await asyncio.create_subprocess_shell(
-        command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
-    )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    _read_stream(process.stdout, stdout_cb),
+                    _read_stream(process.stderr, stderr_cb),
+                ),
+                timeout,
+            )
+            return await process.wait()
+        except TimeoutError:
+            await process.kill()
+            raise
 
-    assert process.stdout is not None, "stdout is None"
-    assert process.stderr is not None, "stderr is None"
-
-    try:
-        await asyncio.wait_for(
-            asyncio.gather(
-                _read_stream(process.stdout, stdout_cb),
-                _read_stream(process.stderr, stderr_cb),
-            ),
-            timeout,
-        )
-        return await process.wait()
-    except TimeoutError:
-        process.kill()
-        raise
+    def _shell_args(self, command: str) -> tuple[str, ...]:
+        if self._is_powershell:
+            return (str(self._shell_path), "-command", command)
+        return (str(self._shell_path), "-c", command)

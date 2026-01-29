@@ -3,16 +3,8 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from kosong.message import (
-    AudioURLPart,
-    ContentPart,
-    ImageURLPart,
-    Message,
-    TextPart,
-    ThinkPart,
-    ToolCall,
-)
-from rich.console import Group
+from kosong.message import Message
+from rich.console import Group, RenderableType
 from rich.panel import Panel
 from rich.rule import Rule
 from rich.syntax import Syntax
@@ -20,10 +12,19 @@ from rich.text import Text
 
 from kimi_cli.soul.kimisoul import KimiSoul
 from kimi_cli.ui.shell.console import console
-from kimi_cli.ui.shell.metacmd import meta_command
+from kimi_cli.ui.shell.slash import registry
+from kimi_cli.wire.types import (
+    AudioURLPart,
+    ContentPart,
+    ImageURLPart,
+    TextPart,
+    ThinkPart,
+    ToolCall,
+    VideoURLPart,
+)
 
 if TYPE_CHECKING:
-    from kimi_cli.ui.shell import ShellApp
+    from kimi_cli.ui.shell import Shell
 
 
 def _format_content_part(part: ContentPart) -> Text | Panel | Group:
@@ -50,13 +51,16 @@ def _format_content_part(part: ContentPart) -> Text | Panel | Group:
 
         case ImageURLPart(image_url=img):
             url_display = img.url[:80] + "..." if len(img.url) > 80 else img.url
-            id_text = f" (id: {img.id})" if img.id else ""
-            return Text(f"[Image{id_text}] {url_display}", style="blue")
+            return Text(f"[Image] {url_display}", style="blue")
 
         case AudioURLPart(audio_url=audio):
             url_display = audio.url[:80] + "..." if len(audio.url) > 80 else audio.url
             id_text = f" (id: {audio.id})" if audio.id else ""
             return Text(f"[Audio{id_text}] {url_display}", style="blue")
+
+        case VideoURLPart(video_url=video):
+            url_display = video.url[:80] + "..." if len(video.url) > 80 else video.url
+            return Text(f"[Video] {url_display}", style="blue")
 
         case _:
             return Text(f"[Unknown content type: {type(part).__name__}]", style="red")
@@ -108,14 +112,11 @@ def _format_message(msg: Message, index: int) -> Panel:
         role_text += f" [dim]→ {msg.tool_call_id}[/dim]"
 
     # Format content
-    content_items: list = []
+    content_items: list[RenderableType] = []
 
-    if isinstance(msg.content, str):
-        content_items.append(Text(msg.content, style="white"))
-    else:
-        for part in msg.content:
-            formatted = _format_content_part(part)
-            content_items.append(formatted)
+    for part in msg.content:
+        formatted = _format_content_part(part)
+        content_items.append(formatted)
 
     # Add tool calls if present
     if msg.tool_calls:
@@ -143,12 +144,12 @@ def _format_message(msg: Message, index: int) -> Panel:
     )
 
 
-@meta_command(kimi_soul_only=True)
-def debug(app: ShellApp, args: list[str]):
+@registry.command
+def debug(app: Shell, args: str):
     """Debug the context"""
     assert isinstance(app.soul, KimiSoul)
 
-    context = app.soul._context
+    context = app.soul.context
     history = context.history
 
     if not history:
@@ -168,7 +169,7 @@ def debug(app: ShellApp, args: list[str]):
                 Text(f"Total messages: {len(history)}", style="bold"),
                 Text(f"Token count: {context.token_count:,}", style="bold"),
                 Text(f"Checkpoints: {context.n_checkpoints}", style="bold"),
-                Text(f"Trajectory: {context._file_backend}", style="dim"),
+                Text(f"Trajectory: {context.file_backend}", style="dim"),
             ),
             title="[bold]Context Info[/bold]",
             border_style="cyan",
